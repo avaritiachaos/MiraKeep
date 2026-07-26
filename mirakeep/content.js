@@ -1,49 +1,34 @@
 // ============================================================
-// MiraKeep — content.js
-// 注入到所有页面，捕获右键点击的真实图片 URL
+// 原封 (YuanFeng) — content.js
+// 注入到所有页面（含 iframe），捕获右键点击的真实图片 URL
+//
+// v6 修复：
+//   - 每次右键都重新捕获，找不到就清空（不再把上一次的旧图
+//     错当成这一次的目标 —— 旧版"有时候没效果/存错图"的主因）
+//   - srcset 最大分辨率优先于 currentSrc，且相对路径解析成绝对 URL
+//   - 删除从未生效的 storage.session 兜底（content script 默认无权访问）
+//   - 就近向上找大图，替代旧版"全页面乱抓第一张 Twitter 图"
 // ============================================================
 
 (() => {
   "use strict";
 
-  // 最近一次右键图片信息
+  // 本 frame 最近一次右键的图片信息；每次右键都覆盖（可能为 null）
   let lastImage = null;
 
   // ==========================================================
-  // 1. 监听右键菜单事件，捕获真实图片 URL
+  // 1. 监听右键，捕获真实图片 URL
   // ==========================================================
   document.addEventListener("contextmenu", (e) => {
-    const info = extractImageInfo(e.target);
-    if (info && info.url) {
-      lastImage = info;
-      // 同步写入 storage.session，background 可直接读取
-      try {
-        chrome.storage.session.set({ lastRightClickedImage: info });
-      } catch (_) {
-        // session storage 可能不可用，忽略
-      }
-      console.log("[MiraKeep content] Captured image:", info.url);
-    }
+    lastImage = extractImageInfo(e.target);
   }, true);
 
   // ==========================================================
-  // 2. 监听 background 的消息请求（获取最近右键图片）
+  // 2. 响应 background 的查询（background 按 frameId 定向发来）
   // ==========================================================
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type === "getLastImage") {
-      // 优先返回内存中的，其次从 session storage 读
-      if (lastImage && lastImage.url) {
-        sendResponse(lastImage);
-      } else {
-        try {
-          chrome.storage.session.get("lastRightClickedImage", (data) => {
-            sendResponse(data.lastRightClickedImage || null);
-          });
-        } catch (_) {
-          sendResponse(null);
-        }
-        return true; // 异步 sendResponse
-      }
+    if (msg && msg.type === "getLastImage") {
+      sendResponse(lastImage && lastImage.url ? lastImage : null);
     }
   });
 
@@ -51,57 +36,27 @@
   // 3. 从事件目标提取图片信息
   // ==========================================================
   function extractImageInfo(target) {
-    if (!target) return null;
+    if (!(target instanceof Element)) return null;
 
-    // --- 情况 A：目标本身就是 <img> ---
-    if (target.tagName === "IMG") {
+    // A. 目标本身是 <img>
+    if (target instanceof HTMLImageElement) {
       return buildInfoFromImg(target);
     }
 
-    // --- 情况 B：目标是 <picture> 的 <source> ---
+    // B. 目标是 <picture> 里的 <source>
     if (target.tagName === "SOURCE") {
       const picture = target.closest("picture");
-      if (picture) {
-        const img = picture.querySelector("img");
-        if (img) return buildInfoFromImg(img);
-      }
+      const img = picture && picture.querySelector("img");
+      if (img) return buildInfoFromImg(img);
     }
 
-    // --- 情况 C：目标是背景图的 div / a / span 等 ---
+    // C. 目标带 CSS 背景图
     const bgUrl = getBackgroundImageUrl(target);
-    if (bgUrl) {
-      return makeInfo(bgUrl, target);
-    }
+    if (bgUrl) return makeInfo(bgUrl, target);
 
-    // --- 情况 D：向上找最近的 <img> 祖先 ---
-    const ancestorImg = target.closest("img");
-    if (ancestorImg) {
-      return buildInfoFromImg(ancestorImg);
-    }
-
-    // --- 情况 E：向下找子元素中的 <img> ---
-    const childImg = target.querySelector("img");
-    if (childImg) {
-      return buildInfoFromImg(childImg);
-    }
-
-    // --- 情况 F：在附近兄弟节点中找 <img> ---
-    const parent = target.parentElement;
-    if (parent) {
-      const nearbyImg = parent.querySelector("img");
-      if (nearbyImg) {
-        return buildInfoFromImg(nearbyImg);
-      }
-    }
-
-    // --- 情况 G：Twitter 特殊处理 ---
-    // Twitter 有时用 div[background-image] 或 canvas，尝试全局找 pbs.twimg.com 图片
-    const twitterImg = findTwitterImage(target);
-    if (twitterImg) {
-      return twitterImg;
-    }
-
-    return null;
+    // D. 就近向上找：图片查看器常用透明层盖在 <img> 上，
+    //    逐级向上在祖先容器里找面积最大的图（太小的图标/头像不算）
+    return findNearbyLargestImage(target);
   }
 
   // ==========================================================
@@ -109,144 +64,135 @@
   // ==========================================================
   function buildInfoFromImg(img) {
     let url = pickBestUrl(img);
-    if (!url) return null;
 
-    // 如果是 blob: 或 data:，尝试找真实 URL
-    if (url.startsWith("blob:") || url.startsWith("data:")) {
-      const realUrl = findRealUrlNear(img);
-      if (realUrl) url = realUrl;
-    }
+    // blob: 等拿不到直链时，在附近找可下载的真实 URL
+    if (!url) url = findRealUrlNear(img);
+    if (!url) return null;
 
     return makeInfo(url, img);
   }
 
   // ==========================================================
   // 5. 从 <img> 中选最佳 URL
-  //    优先 currentSrc → srcset 最大项 → src
+  //    srcset 最大项 → currentSrc → src（全部解析为绝对 URL）
   // ==========================================================
   function pickBestUrl(img) {
-    // 优先 currentSrc（浏览器实际加载的）
-    if (img.currentSrc && !isInternalUrl(img.currentSrc)) {
-      return img.currentSrc;
+    // srcset 里的最大分辨率通常优于 currentSrc（浏览器按视口选的小图）
+    const fromSrcset = parseSrcset(img);
+    if (fromSrcset) return fromSrcset;
+
+    if (img.currentSrc && !isInternalUrl(img.currentSrc)) return img.currentSrc;
+    if (img.src && !isInternalUrl(img.src)) return img.src;
+
+    // 懒加载占位场景：真实大图往往在 data-src 等属性里
+    for (const attr of ["data-src", "data-original", "data-lazy-src", "data-hi-res-src", "data-large-src"]) {
+      const v = img.getAttribute(attr);
+      if (v) {
+        const abs = toAbsolute(v.trim());
+        if (abs && !isInternalUrl(abs)) return abs;
+      }
     }
 
-    // 解析 srcset，取最大分辨率
-    const srcsetMax = parseSrcset(img);
-    if (srcsetMax) return srcsetMax;
-
-    // src 属性
-    if (img.src && !isInternalUrl(img.src)) {
-      return img.src;
+    const raw = img.getAttribute("src");
+    if (raw) {
+      const abs = toAbsolute(raw);
+      if (abs && !isInternalUrl(abs)) return abs;
     }
 
-    // 从属性直接读（绕过相对路径解析）
-    const rawSrc = img.getAttribute("src");
-    if (rawSrc && rawSrc.startsWith("http")) {
-      return rawSrc;
-    }
+    // 页面内嵌 data:image 也允许保存（background 会原样落盘）
+    const cur = img.currentSrc || img.src || "";
+    if (/^data:image\//i.test(cur)) return cur;
 
     return null;
   }
 
   // ==========================================================
-  // 6. 解析 srcset，返回最大分辨率的 URL
+  // 6. 解析 srcset，返回最大分辨率的绝对 URL
   // ==========================================================
   function parseSrcset(img) {
     const srcset = img.getAttribute("srcset");
     if (!srcset) return null;
 
-    const entries = srcset.split(",").map((entry) => {
-      const parts = entry.trim().split(/\s+/);
-      const url = parts[0];
-      let size = 0;
-      if (parts[1]) {
-        // "400w" → 400, "2x" → 2
-        if (parts[1].endsWith("w")) {
-          size = parseInt(parts[1], 10) || 0;
-        } else if (parts[1].endsWith("x")) {
-          size = (parseFloat(parts[1]) || 1) * 1000;
-        }
-      }
-      return { url, size };
-    }).filter((e) => e.url && !isInternalUrl(e.url));
+    const entries = [];
+    for (const part of srcset.split(",")) {
+      const bits = part.trim().split(/\s+/);
+      if (!bits[0]) continue;
+      const abs = toAbsolute(bits[0]);
+      if (!abs || isInternalUrl(abs)) continue;
 
+      let size = 0;
+      const d = bits[1] || "";
+      if (d.endsWith("w")) size = parseInt(d, 10) || 0;
+      else if (d.endsWith("x")) size = (parseFloat(d) || 1) * 1000;
+      entries.push({ url: abs, size });
+    }
     if (entries.length === 0) return null;
 
-    // 按 size 降序，取最大的
     entries.sort((a, b) => b.size - a.size);
+    // 全都没有尺寸描述符时无从比较，交给 currentSrc
+    if (entries[0].size === 0) return null;
     return entries[0].url;
   }
 
   // ==========================================================
-  // 7. 在附近寻找真实 URL（排除 blob:/data:）
+  // 7. blob:/data: 拿不到直链时，在附近找真实 URL
   // ==========================================================
   function findRealUrlNear(img) {
-    // 检查同级所有 img
-    const parent = img.parentElement;
-    if (parent) {
-      for (const sibling of parent.querySelectorAll("img")) {
-        if (sibling !== img) {
-          const url = pickBestUrl(sibling);
-          if (url && !isInternalUrl(url)) return url;
-        }
-      }
-    }
-
-    // 检查 picture > source
+    // <picture> 的 <source srcset>
     const picture = img.closest("picture");
     if (picture) {
       for (const source of picture.querySelectorAll("source")) {
         const srcset = source.getAttribute("srcset");
         if (srcset) {
-          const first = srcset.split(",")[0].trim().split(/\s+/)[0];
-          if (first && first.startsWith("http")) return first;
+          const first = toAbsolute(srcset.split(",")[0].trim().split(/\s+/)[0]);
+          if (first && !isInternalUrl(first)) return first;
         }
       }
     }
 
-    // 全局搜索 pbs.twimg.com 图片
-    return findTwitterGlobal();
+    // 同级容器里的其他 img
+    const near = img.parentElement && bestImgUnder(img.parentElement);
+    return near ? near.url : null;
   }
 
   // ==========================================================
-  // 8. Twitter 专用：在页面中搜索 pbs.twimg.com 图片
+  // 8. 就近向上找面积最大的图（最多向上 6 层）
   // ==========================================================
-  function findTwitterImage(target) {
-    // 检查目标的父级容器中是否有 Twitter 图片
+  function findNearbyLargestImage(target) {
     let el = target;
-    for (let i = 0; i < 5 && el; i++) {
-      const imgs = el.querySelectorAll("img");
-      for (const img of imgs) {
-        const url = pickBestUrl(img);
-        if (url && url.includes("pbs.twimg.com/media/")) {
-          return makeInfo(url, img);
-        }
-      }
+    for (let depth = 0; depth < 6 && el && el !== document.documentElement; depth++) {
+      const found = bestImgUnder(el);
+      if (found) return found;
+
+      const bg = getBackgroundImageUrl(el);
+      if (bg) return makeInfo(bg, el);
+
       el = el.parentElement;
     }
-
-    // 全局搜索
-    return findTwitterGlobal() ? makeInfo(findTwitterGlobal(), target) : null;
+    return null;
   }
 
-  function findTwitterGlobal() {
-    // 在所有 img 中找 pbs.twimg.com
-    const allImgs = document.querySelectorAll("img");
-    for (const img of allImgs) {
+  function bestImgUnder(root) {
+    const imgs = root.querySelectorAll("img");
+    let bestUrl = null;
+    let bestEl = null;
+    let bestScore = 0;
+
+    for (const img of imgs) {
       const url = pickBestUrl(img);
-      if (url && url.includes("pbs.twimg.com/media/")) {
-        return url;
+      if (!url) continue;
+      const area = (img.naturalWidth || img.width || 0) * (img.naturalHeight || img.height || 0);
+      let score = area;
+      if (url.indexOf("pbs.twimg.com/media/") > -1) score += 1e9; // Twitter 正文图优先
+      if (score > bestScore) {
+        bestScore = score;
+        bestUrl = url;
+        bestEl = img;
       }
     }
 
-    // 在所有 a[href] 中找
-    const allLinks = document.querySelectorAll("a[href]");
-    for (const a of allLinks) {
-      if (a.href.includes("pbs.twimg.com/media/")) {
-        return a.href;
-      }
-    }
-
+    // 面积太小（图标/头像级别）不算数，让调用方继续向上找
+    if (bestUrl && bestScore >= 100 * 100) return makeInfo(bestUrl, bestEl);
     return null;
   }
 
@@ -259,8 +205,9 @@
       const bg = style.backgroundImage;
       if (bg && bg !== "none") {
         const match = bg.match(/url\(["']?(.*?)["']?\)/);
-        if (match && match[1] && match[1].startsWith("http")) {
-          return match[1];
+        if (match && match[1]) {
+          const abs = toAbsolute(match[1]);
+          if (abs && !isInternalUrl(abs)) return abs;
         }
       }
     } catch (_) {}
@@ -282,10 +229,18 @@
   }
 
   // ==========================================================
-  // 11. 判断是否为内部 URL（blob:, data:, about:, chrome:）
+  // 11. 工具
   // ==========================================================
+  function toAbsolute(raw) {
+    try {
+      return new URL(raw, document.baseURI).href;
+    } catch (_) {
+      return null;
+    }
+  }
+
   function isInternalUrl(url) {
-    return /^(blob:|data:|about:|chrome:|chrome-extension:|edge:)/i.test(url);
+    return /^(blob:|data:|about:|javascript:|chrome:|chrome-extension:|edge:)/i.test(url);
   }
 
 })();
