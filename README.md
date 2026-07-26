@@ -1,8 +1,11 @@
-# MiraKeep
+# 原封 (YuanFeng)
 
 > Chrome / Edge extension to save images in their original format without quality loss.
+> Formerly known as **MiraKeep** (the repo keeps the old directory name).
 
-Solves the problem of Twitter/X images being saved as `.exif` by the browser or download managers.
+Right-click any image → **保存原图** (Save Original). What lands on disk is the exact
+byte stream the server returned — no canvas, no re-encoding, no recompression —
+with the correct filename and extension (no more `.exif` / `.jfif`).
 
 ## Install
 
@@ -11,23 +14,32 @@ Solves the problem of Twitter/X images being saved as `.exif` by the browser or 
 3. Enable **Developer mode**
 4. Click **Load unpacked** → select the `mirakeep` folder
 
-## Usage
-
-Right-click any image → **MiraKeep: Save Original**
+After updating from an older version: hit **Reload** on the extension, then
+**refresh open tabs** so the new content script takes over.
 
 ## Features
 
-- **Zero quality loss** — no canvas, no re-encoding, no recompression
-- **Smart extension detection** — `format` param → Content-Type → URL path → fallback `.jpg`
-- **Twitter/X optimized** — extracts image ID, upgrades to original quality (`name=orig`)
-- **Forces correct extension** — uses `onDeterminingFilename` to prevent `.exif` overwrite
-- **Clean filenames** — `HKVwXVLa0AAwuyM.jpg` instead of random server names
+- **Zero quality loss** — original bytes only, byte-identical to the server response
+- **Original-quality upgrades** — Twitter/X `name=orig`, Weibo `/large/`, pixiv `img-master → img-original`
+- **Resilient download chain** — candidate URLs tried in order with a `Referer` header
+  (hotlink-protected CDNs work); on failure falls back to a service-worker `fetch`;
+  a red ✕ badge on the toolbar icon signals total failure instead of silence
+- **Forced correct extension** — `onDeterminingFilename` beats Chrome's content
+  sniffing, so EXIF-bearing JPEGs stay `.jpg`
+- **Works inside iframes** — content script injected into all frames, queried by `frameId`
+- **Fresh capture per right-click** — stale state from a previous click is cleared,
+  so you never save yesterday's image by accident
 
 ## How it works
 
-1. Content script captures the real image URL on right-click (including `srcset` parsing)
-2. Background script normalizes the URL and determines the correct file extension
-3. Downloads the image with `chrome.downloads.download` and forces the correct filename via `onDeterminingFilename`
+1. The content script captures the real image URL at the exact element you
+   right-clicked (largest `srcset` entry, CSS background images, image-viewer
+   overlays), resolving relative URLs
+2. The background service worker builds a candidate chain (original → large →
+   as-clicked), picks the extension (`format` param → path → HEAD `Content-Type`),
+   and downloads with `chrome.downloads.download` + `Referer`
+3. Failed candidates advance automatically; `onDeterminingFilename` forces the
+   correct filename on whatever succeeds
 
 No canvas. No PNG conversion. Just the original bytes with the right name.
 

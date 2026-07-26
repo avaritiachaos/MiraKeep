@@ -1,14 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "MiraKeep",
-  "description": "Original Image Saver — Save images in their original format without quality loss.",
-  "version": "1.1.0",
+  "name": "原封 - 原图无损保存",
+  "short_name": "原封",
+  "description": "原封不动保存网页图片：不重编码、无画质损失，自动纠正 .exif/.jfif 扩展名，右键即存 Twitter/X、微博、pixiv 原图。",
+  "version": "2.0.0",
   "permissions": [
     "contextMenus",
     "downloads",
-    "activeTab",
-    "scripting",
-    "storage"
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -20,9 +19,19 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
+  "action": {
+    "default_title": "原封：右键图片 → 保存原图",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
