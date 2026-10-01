@@ -2,12 +2,13 @@
   "manifest_version": 3,
   "name": "原封 - 原图无损保存",
   "short_name": "原封",
-  "description": "原封不动保存网页图片：不重编码、无画质损失，自动纠正 .exif/.jfif 扩展名，右键即存 Twitter/X、微博、pixiv 原图。",
-  "version": "2.0.0",
+  "description": "原封不动保存网页图片与动图：不重编码、无画质损失，自动纠正 .exif/.jfif 扩展名，右键即存 Twitter/X、微博、pixiv 原图及 Twitter GIF 动图。",
+  "version": "2.1.0",
   "permissions": [
     "contextMenus",
     "downloads",
-    "scripting"
+    "scripting",
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -18,7 +19,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["lib/gifenc.js", "content.js"],
       "run_at": "document_idle",
       "all_frames": true,
       "match_about_blank": true
@@ -26,6 +27,7 @@
   ],
   "action": {
     "default_title": "原封：右键图片 → 保存原图",
+    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",

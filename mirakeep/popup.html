@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>原封 - 设置</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      width: 330px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: #0f1419;
+      color: #e7e9ea;
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 16px;
+      user-select: none;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #2f3336;
+    }
+    .header img {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+    }
+    .header-info {
+      flex: 1;
+    }
+    .header-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .version-tag {
+      font-size: 11px;
+      font-weight: 500;
+      color: #1d9bf0;
+      background: rgba(29, 155, 240, 0.12);
+      padding: 1px 6px;
+      border-radius: 10px;
+    }
+    .header-desc {
+      font-size: 11px;
+      color: #71767b;
+      margin-top: 1px;
+    }
+    .section {
+      margin-bottom: 14px;
+    }
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: #8b98a5;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .radio-card {
+      display: block;
+      background: #16181c;
+      border: 1px solid #2f3336;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .radio-card:hover {
+      border-color: #536471;
+      background: #1c1f24;
+    }
+    .radio-card.active {
+      border-color: #1d9bf0;
+      background: rgba(29, 155, 240, 0.08);
+    }
+    .radio-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .radio-card input[type="radio"] {
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border: 2px solid #536471;
+      border-radius: 50%;
+      outline: none;
+      position: relative;
+      margin: 0;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .radio-card input[type="radio"]:checked {
+      border-color: #1d9bf0;
+      background: #1d9bf0;
+    }
+    .radio-card input[type="radio"]:checked::after {
+      content: "";
+      position: absolute;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #fff;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+    }
+    .radio-label {
+      font-weight: 600;
+      color: #f7f9f9;
+      font-size: 13px;
+    }
+    .radio-desc {
+      font-size: 11px;
+      color: #71767b;
+      margin-top: 4px;
+      margin-left: 24px;
+      line-height: 1.4;
+    }
+    .sub-options {
+      background: #16181c;
+      border: 1px solid #2f3336;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-top: 6px;
+    }
+    .option-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+    }
+    .option-row:not(:last-child) {
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .option-row label {
+      font-size: 12px;
+      color: #8b98a5;
+    }
+    .option-row select {
+      background: #202327;
+      border: 1px solid #536471;
+      color: #e7e9ea;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      outline: none;
+      cursor: pointer;
+    }
+    .option-row select:focus {
+      border-color: #1d9bf0;
+    }
+    .tip-box {
+      background: rgba(29, 155, 240, 0.06);
+      border-left: 3px solid #1d9bf0;
+      padding: 8px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      color: #8b98a5;
+      line-height: 1.4;
+      margin-top: 12px;
+    }
+    .tip-box strong {
+      color: #e7e9ea;
+    }
+    .status-bar {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #00ba7c;
+      text-align: right;
+      height: 16px;
+      transition: opacity 0.3s;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <img src="icons/icon48.png" alt="原封">
+    <div class="header-info">
+      <div class="header-title">
+        <span>原封</span>
+        <span class="version-tag">v2.1.0</span>
+      </div>
+      <div class="header-desc">原图无损保存 · 动图支持</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Twitter / X 动图保存格式</div>
+    <label class="radio-card active" id="card-gif">
+      <div class="radio-header">
+        <input type="radio" name="gifFormat" value="gif" id="radio-gif" checked>
+        <span class="radio-label">转存为真实 .gif 动图 (推荐)</span>
+      </div>
+      <div class="radio-desc">在浏览器内转码为 .gif 文件，方便直接发微信/QQ表情包及各平台发布。</div>
+    </label>
+
+    <label class="radio-card" id="card-mp4">
+      <div class="radio-header">
+        <input type="radio" name="gifFormat" value="mp4" id="radio-mp4">
+        <span class="radio-label">保存为原始 .mp4 视频</span>
+      </div>
+      <div class="radio-desc">下载推特 CDN 原始视频文件，原画质、无重编码、体积小、秒级下载。</div>
+    </label>
+
+    <div class="sub-options" id="gif-params">
+      <div class="option-row">
+        <label for="gifMaxWidth">动图尺寸上限</label>
+        <select id="gifMaxWidth">
+          <option value="480">480 px (小体积)</option>
+          <option value="640" selected>640 px (推荐平衡)</option>
+          <option value="0">原始尺寸</option>
+        </select>
+      </div>
+      <div class="option-row">
+        <label for="gifFps">采样帧率</label>
+        <select id="gifFps">
+          <option value="15">15 fps (紧凑)</option>
+          <option value="20" selected>20 fps (推荐流畅)</option>
+          <option value="25">25 fps (高平滑)</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="tip-box">
+    <strong>使用方式：</strong>在任意图片或 Twitter 动图上右键，点击<strong>「保存原图」</strong>即可保存。普通图片始终原封不动保存原始字节。
+  </div>
+
+  <div class="status-bar" id="status-bar"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

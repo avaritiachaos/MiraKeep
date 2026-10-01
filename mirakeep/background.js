@@ -1,22 +1,16 @@
 // ============================================================
-// 原封 (YuanFeng) — background.js  (v6)
+// 原封 (YuanFeng) — background.js  (v2.1.0)
 // Service Worker (Manifest V3)
 //
-// ★ 两个核心问题：
-//   1. Chrome 对下载内容做 content sniffing，JPEG 里的 EXIF 元数据
-//      会让扩展名被改成 .exif / .jfif。
-//      → onDeterminingFilename 强制覆盖文件名。
-//   2. "有时候没效果" 的几大元凶（v6 修复）：
-//      - content.js 的旧图残留被当成本次目标（优先级/清空问题）
-//      - iframe 里的图查不到（没按 frameId 定向）
-//      - 防盗链站点（微博/pixiv 等）不带 Referer 直接 403
-//      - blob:/相对路径 URL 直接丢给 downloads API 静默失败
-//      - onDeterminingFilename 注册晚于事件触发的竞态
-//
-// ★ 下载策略（逐级兜底）：
-//   候选 URL 链（原图 → 大图 → 原始 URL）依次直接下载（带 Referer），
-//   某个候选失败自动换下一个；全部失败后在 SW 里 fetch 转 data URL
-//   再下载；仍失败则在工具栏图标上闪一个 ✕ 徽章提示。
+// ★ 核心特性：
+//   1. 原图无损保存：直接保存原始字节流，纠正 .exif / .jfif 扩展名。
+//   2. 动图扩展支持（v2.1.0 新增）：
+//      - 识别 Twitter/X 动图（tweet_video_thumb / tweet_video / <video>）。
+//      - 默认在 content.js 中通过 gifenc 转码为真实 .gif 动图文件，方便作为表情包。
+//      - 可在弹出设置中一键切换为保存 MP4 原始无损视频。
+//      - 转码失败自动降级到直接下载 MP4 原件，确保绝不丢失内容。
+//   3. 逐级兜底策略：
+//      候选链直接下载（带 Referer）→ 换候选 → SW fetch 兜底 → 状态徽章反馈。
 // ============================================================
 
 const MENU_ID = "yuanfeng-save";
@@ -24,6 +18,7 @@ const MENU_ID = "yuanfeng-save";
 const KNOWN_EXTS = new Set([
   "jpg", "jpeg", "png", "gif", "webp", "avif",
   "svg", "bmp", "tiff", "tif", "ico",
+  "mp4", "webm",
 ]);
 
 const EXT_BY_MIME = {
@@ -37,6 +32,8 @@ const EXT_BY_MIME = {
   "image/tiff": "tiff",
   "image/x-icon": "ico",
   "image/vnd.microsoft.icon": "ico",
+  "video/mp4": "mp4",
+  "video/webm": "webm",
 };
 
 const MIME_BY_EXT = {
@@ -44,10 +41,11 @@ const MIME_BY_EXT = {
   gif: "image/gif", webp: "image/webp", avif: "image/avif",
   svg: "image/svg+xml", bmp: "image/bmp", tiff: "image/tiff",
   tif: "image/tiff", ico: "image/x-icon",
+  mp4: "video/mp4", webm: "video/webm",
 };
 
 // ============================================================
-// 1. 安装：注册右键菜单（先 removeAll，避免更新时重复 id 报错）
+// 1. 安装：注册右键菜单
 // ============================================================
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -60,11 +58,25 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 // ============================================================
-// 2. 强制覆盖文件名：拦截 Chrome 的文件名推断（防 .exif/.jfif）
-//
-//    竞态修复：download() 的 Promise resolve 与本事件的先后顺序
-//    没有保证，所以除了按 downloadId 注册，还在调用 download()
-//    之前就按 URL 预注册一份。
+// 2. 消息监听：处理跨域 Blob 代理请求
+// ============================================================
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.type === "fetchVideoBlob") {
+    fetch(msg.url)
+      .then((r) => r.blob())
+      .then((b) => {
+        const reader = new FileReader();
+        reader.onloadend = () => sendResponse({ success: true, dataUrl: reader.result });
+        reader.onerror = () => sendResponse({ success: false, error: "FileReader 读取失败" });
+        reader.readAsDataURL(b);
+      })
+      .catch((e) => sendResponse({ success: false, error: (e && e.message) || String(e) }));
+    return true;
+  }
+});
+
+// ============================================================
+// 3. 强制覆盖文件名：拦截 Chrome 的文件名推断
 // ============================================================
 const pendingById = new Map();   // downloadId → filename
 const pendingByUrl = new Map();  // url → filename（download() 调用前预注册）
@@ -75,7 +87,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 
   if (!name && item.byExtensionId === chrome.runtime.id) {
     name = pendingByUrl.get(item.url) || pendingByUrl.get(item.finalUrl);
-    if (!name && expectedDataName && item.url && item.url.startsWith("data:")) {
+    if (!name && expectedDataName && item.url && (item.url.startsWith("data:") || item.url.startsWith("blob:"))) {
       name = expectedDataName;
       expectedDataName = null;
     }
@@ -90,55 +102,156 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 });
 
 // ============================================================
-// 3. 右键菜单点击
+// 4. 右键菜单点击
 // ============================================================
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== MENU_ID) return;
 
-  const src = await resolveImageUrl(info, tab);
-  if (!src) {
-    console.warn("[原封] 未在点击位置找到图片");
-    flashBadge(tab, "✕");
+  const media = await resolveMedia(info, tab);
+  if (!media || !media.url) {
+    console.warn("[原封] 未在点击位置找到图片或动图");
+    flashBadge(tab, "✕", "#D93025");
     return;
   }
-  console.log("[原封] 目标图片:", src.slice(0, 120));
 
-  // 页面内嵌的 data:image 直接下载（字节原样保存）
-  if (/^data:image\//i.test(src)) {
+  const src = media.url;
+  console.log("[原封] 目标媒体:", src.slice(0, 120), "isGif:", media.isGif, "isVideo:", media.isVideo);
+
+  // 页面内嵌的 data: URL 直接下载
+  if (/^data:(image|video)\//i.test(src)) {
     await downloadDataUrl(src, tab);
     return;
   }
 
-  // Referer：防盗链站点（微博/pixiv 等）没有它会 403
-  const referer = info.frameUrl || info.pageUrl || (tab && tab.url) || "";
+  // 读取用户偏好配置
+  const settings = await getSettings();
 
+  // 若为动图（Twitter GIF 或带有循环播放的短视频），且用户设置为转存 .gif 动图
+  if (media.isGif && settings.gifFormat === "gif" && !src.endsWith(".gif")) {
+    const success = await handleGifDownload(media, info, tab, settings);
+    if (success) return;
+    console.warn("[原封] 动图转码失败，自动降级为直接下载原格式");
+  }
+
+  // 正常媒体下载链路（图片 或 MP4 原视频）
+  const referer = info.frameUrl || info.pageUrl || (tab && tab.url) || "";
   const candidates = buildCandidates(src);
   await startDownload({ candidates, index: 0, referer, tab });
 });
 
 // ============================================================
-// 4. 获取图片 URL（降级链）
-//    A. content.js 在本次右键时捕获的图（按 frameId 定向查询）
-//    B. Chrome 自带的 info.srcUrl
-//    C. 指向图片的 info.linkUrl
-//    D. 注入脚本找页面里最大的图
+// 5. 动图转码下载调度
 // ============================================================
-async function resolveImageUrl(info, tab) {
+async function handleGifDownload(media, info, tab, settings) {
+  if (!tab || tab.id == null || tab.id < 0) return false;
+
+  flashBadge(tab, "GIF", "#1DA1F2", 60000);
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    const finish = (val) => {
+      if (!resolved) {
+        resolved = true;
+        resolve(val);
+      }
+    };
+
+    // 45 秒超时保护
+    const timer = setTimeout(() => {
+      flashBadge(tab, "✕", "#D93025", 2500);
+      finish(false);
+    }, 45000);
+
+    try {
+      chrome.tabs.sendMessage(
+        tab.id,
+        {
+          type: "convertVideoToGif",
+          url: media.url,
+          mediaKey: media.mediaKey,
+          options: {
+            maxWidth: settings.gifMaxWidth === 0 ? 0 : (settings.gifMaxWidth || 640),
+            fps: settings.gifFps || 20,
+          },
+        },
+        { frameId: info.frameId || 0 },
+        async (resp) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError || !resp || !resp.success || !resp.dataUrl) {
+            const errStr = (resp && resp.error) || (chrome.runtime.lastError && chrome.runtime.lastError.message);
+            console.warn("[原封] GIF 转码未能完成:", errStr);
+            flashBadge(tab, "✕", "#D93025", 2500);
+            finish(false);
+            return;
+          }
+
+          try {
+            const filename = buildFilename(
+              media.mediaKey ? "https://video.twimg.com/tweet_video/" + media.mediaKey + ".gif" : media.url,
+              "gif"
+            );
+            expectedDataName = filename;
+            const id = await chrome.downloads.download({
+              url: resp.dataUrl,
+              filename: filename,
+              saveAs: true,
+              conflictAction: "uniquify",
+            });
+            pendingById.set(id, filename);
+            setTimeout(() => pendingById.delete(id), 60000);
+            flashBadge(tab, "✓", "#00BA7C", 2000);
+            finish(true);
+          } catch (dlErr) {
+            if (/cancel/i.test((dlErr && dlErr.message) || "")) {
+              flashBadge(tab, "", "#1DA1F2", 100);
+              finish(true);
+            } else {
+              console.error("[原封] GIF 下载出错:", dlErr);
+              flashBadge(tab, "✕", "#D93025", 2500);
+              finish(false);
+            }
+          }
+        }
+      );
+    } catch (_) {
+      clearTimeout(timer);
+      finish(false);
+    }
+  });
+}
+
+// ============================================================
+// 6. 获取媒体信息（降级链）
+// ============================================================
+async function resolveMedia(info, tab) {
+  // A. content.js 捕获的信息
   const fromContent = await queryContentScript(tab, info.frameId);
-  if (isDownloadableUrl(fromContent)) return fromContent;
+  if (fromContent && isDownloadableUrl(fromContent.url)) {
+    return fromContent;
+  }
 
-  if (isDownloadableUrl(info.srcUrl)) return info.srcUrl;
+  // B. Chrome 自带的 info.srcUrl
+  if (isDownloadableUrl(info.srcUrl)) {
+    const isG = /\.gif(\?|$)/i.test(info.srcUrl) || /tweet_video/.test(info.srcUrl);
+    return { url: info.srcUrl, isGif: isG };
+  }
 
-  if (info.linkUrl && isDownloadableUrl(info.linkUrl) && looksLikeImage(info.linkUrl))
-    return info.linkUrl;
+  // C. 指向媒体的 info.linkUrl
+  if (info.linkUrl && isDownloadableUrl(info.linkUrl) && looksLikeMedia(info.linkUrl)) {
+    const isG = /\.gif(\?|$)/i.test(info.linkUrl) || /tweet_video/.test(info.linkUrl);
+    return { url: info.linkUrl, isGif: isG };
+  }
 
+  // D. 注入脚本兜底找页面中最大的图或视频
   if (tab && tab.id != null && tab.id >= 0) {
     try {
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id, frameIds: [info.frameId || 0] },
-        func: findImageInPage,
+        func: findMediaInPage,
       });
-      if (res && isDownloadableUrl(res.result)) return res.result;
+      if (res && res.result && isDownloadableUrl(res.result.url)) {
+        return res.result;
+      }
     } catch (_) {}
   }
 
@@ -146,7 +259,7 @@ async function resolveImageUrl(info, tab) {
 }
 
 // ============================================================
-// 5. 向 content.js 查询（定向到被右键的那个 frame）
+// 7. 向 content.js 查询（定向到被右键的那个 frame）
 // ============================================================
 function queryContentScript(tab, frameId) {
   if (!tab || tab.id == null || tab.id < 0) return Promise.resolve(null);
@@ -161,8 +274,8 @@ function queryContentScript(tab, frameId) {
         { frameId: frameId || 0 },
         (resp) => {
           clearTimeout(timer);
-          void chrome.runtime.lastError; // content script 未注入时静默降级
-          finish(resp && resp.url ? resp.url : null);
+          void chrome.runtime.lastError;
+          finish(resp && resp.url ? resp : null);
         }
       );
     } catch (_) {
@@ -173,9 +286,36 @@ function queryContentScript(tab, frameId) {
 }
 
 // ============================================================
-// 6. 注入兜底：找页面里最大的一张图（Twitter 原图优先）
+// 8. 注入兜底：找页面里最大的一张图或视频
 // ============================================================
-function findImageInPage() {
+function findMediaInPage() {
+  // 1. 查找推特视频 / GIF
+  var videos = document.querySelectorAll("video");
+  for (var v = 0; v < videos.length; v++) {
+    var vid = videos[v];
+    var poster = vid.getAttribute("poster") || vid.poster || "";
+    var m = poster.match(/tweet_video_thumb\/([a-zA-Z0-9_\-]+)/);
+    if (m) {
+      return {
+        url: "https://video.twimg.com/tweet_video/" + m[1] + ".mp4",
+        isGif: true,
+        isTwitterGif: true,
+        mediaKey: m[1],
+      };
+    }
+    var vSrc = vid.currentSrc || vid.src || "";
+    if (vSrc && vSrc.indexOf("tweet_video") > -1) {
+      var m2 = vSrc.match(/tweet_video\/([a-zA-Z0-9_\-]+)\.mp4/);
+      return {
+        url: vSrc,
+        isGif: true,
+        isTwitterGif: true,
+        mediaKey: m2 ? m2[1] : null,
+      };
+    }
+  }
+
+  // 2. 查找最大图片
   var best = null;
   var bestScore = 0;
   var imgs = document.querySelectorAll("img");
@@ -183,6 +323,17 @@ function findImageInPage() {
     var img = imgs[i];
     var url = img.currentSrc || img.src || "";
     if (!url || url.indexOf("blob:") === 0 || url.indexOf("data:") === 0) continue;
+
+    var twThumb = url.match(/tweet_video_thumb\/([a-zA-Z0-9_\-]+)/);
+    if (twThumb) {
+      return {
+        url: "https://video.twimg.com/tweet_video/" + twThumb[1] + ".mp4",
+        isGif: true,
+        isTwitterGif: true,
+        mediaKey: twThumb[1],
+      };
+    }
+
     var area = (img.naturalWidth || 0) * (img.naturalHeight || 0);
     var score = area;
     if (url.indexOf("pbs.twimg.com/media/") > -1) score += 1e9;
@@ -191,11 +342,11 @@ function findImageInPage() {
       best = url;
     }
   }
-  return best;
+  return best ? { url: best, isGif: /\.gif(\?|$)/i.test(best) } : null;
 }
 
 // ============================================================
-// 7. 生成候选 URL 链（原图优先，逐级降级）
+// 9. 生成候选 URL 链（原图/原视频优先，逐级降级）
 // ============================================================
 function buildCandidates(srcUrl) {
   let u;
@@ -214,11 +365,24 @@ function buildCandidates(srcUrl) {
   };
   const host = u.hostname;
 
-  // --- Twitter / X ---
-  // 实测（pbs.twimg.com）：name=orig 只存在于 X 实际存储的格式，
-  // 请求错误的格式直接 404 而不是转码；时间线可能下发 webp 缩略图，
-  // 但 webp 没有 orig。所以按「页面格式 → 另一种」的顺序探测 jpg/png
-  // 原件；跨格式候选先 HEAD 预检，避免 404 时反复弹保存框。
+  // --- Twitter / X 动图 (tweet_video) ---
+  if (host.endsWith("twimg.com") && u.pathname.startsWith("/tweet_video/")) {
+    push(u, { ext: "mp4" });
+    return list;
+  }
+
+  // --- Twitter / X 动图缩略图直接升级为 MP4 ---
+  if (host.endsWith("twimg.com") && u.pathname.startsWith("/tweet_video_thumb/")) {
+    const m = u.pathname.match(/^\/tweet_video_thumb\/([A-Za-z0-9_\-]+)/);
+    if (m) {
+      const v = new URL("https://video.twimg.com/tweet_video/" + m[1] + ".mp4");
+      push(v, { ext: "mp4" });
+    }
+    push(u);
+    return list;
+  }
+
+  // --- Twitter / X 普通静态图 ---
   if (host.endsWith("twimg.com") && u.pathname.startsWith("/media/")) {
     const m = u.pathname.match(/^\/media\/([A-Za-z0-9_\-]+)/);
     if (m) {
@@ -252,7 +416,7 @@ function buildCandidates(srcUrl) {
     return list;
   }
 
-  // --- pixiv：img-master 缩略图 → img-original 原图（jpg/png 都试）---
+  // --- pixiv：img-master 缩略图 → img-original 原图 ---
   if (host === "i.pximg.net" && u.pathname.indexOf("/img-master/") > -1) {
     const base = u.pathname
       .replace(/^\/c\/[^/]+/, "")
@@ -279,7 +443,7 @@ function extOf(urlObj) {
 }
 
 // ============================================================
-// 8. 下载引擎：逐个候选直接下载，失败自动换下一个
+// 10. 下载引擎：逐个候选直接下载，失败自动换下一个
 // ============================================================
 const watching = new Map(); // downloadId → { candidates, index, referer, tab }
 
@@ -294,8 +458,7 @@ async function startDownload(job) {
 
   const cand = candidates[index];
 
-  // 标记了 preflight 的候选先 HEAD 预检：404 直接换下一个，
-  // 免得弹出保存框、用户确认后才发现下载失败
+  // 标记了 preflight 的候选先 HEAD 预检：404 直接换下一个
   if (cand.preflight && !(await headOk(cand.url))) {
     console.log("[原封] 预检未通过，跳过候选:", cand.url.slice(0, 120));
     return startDownload({ ...job, index: index + 1 });
@@ -323,9 +486,8 @@ async function startDownload(job) {
     id = await chrome.downloads.download(opts);
   } catch (err) {
     const msg = (err && err.message) || "";
-    if (/cancel/i.test(msg)) return; // 用户在保存对话框点了取消，不再打扰
+    if (/cancel/i.test(msg)) return; // 用户取消
     console.warn("[原封] download() 失败:", msg);
-    // 个别环境不接受自定义 Referer 头 → 去掉重试一次
     if (opts.headers) {
       delete opts.headers;
       try {
@@ -345,7 +507,7 @@ async function startDownload(job) {
   watching.set(id, job);
 }
 
-// 监听下载结果：中断则换下一个候选（用户主动取消除外）
+// 监听下载结果：中断换下一个候选
 chrome.downloads.onChanged.addListener((delta) => {
   const job = watching.get(delta.id);
   if (!job || !delta.state) return;
@@ -353,6 +515,7 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (delta.state.current === "complete") {
     watching.delete(delta.id);
     console.log("[原封] 下载完成 #" + delta.id);
+    flashBadge(job.tab, "✓", "#00BA7C", 1800);
     return;
   }
 
@@ -360,15 +523,14 @@ chrome.downloads.onChanged.addListener((delta) => {
     watching.delete(delta.id);
     const err = (delta.error && delta.error.current) || "";
     console.warn("[原封] 下载中断 #" + delta.id + ":", err);
-    if (/^USER_/.test(err)) return; // 用户取消/关机，不重试
-    chrome.downloads.erase({ id: delta.id }); // 清掉失败条目，别占着下载栏
+    if (/^USER_/.test(err)) return; // 用户主动取消
+    chrome.downloads.erase({ id: delta.id });
     startDownload({ ...job, index: job.index + 1 });
   }
 });
 
 // ============================================================
-// 9. fetch 兜底：SW 里抓字节 → data URL → 下载
-//    （覆盖 downloads API 走不通、但带 Cookie 的 fetch 可以的情况）
+// 11. fetch 兜底：SW 抓字节 → data URL → 下载
 // ============================================================
 async function fetchFallback(job) {
   for (const cand of job.candidates) {
@@ -396,13 +558,14 @@ async function fetchFallback(job) {
       pendingById.set(id, filename);
       setTimeout(() => pendingById.delete(id), 60000);
       console.log("[原封] fetch 兜底成功:", filename);
+      flashBadge(job.tab, "✓", "#00BA7C", 1800);
       return;
     } catch (_) {
       continue;
     }
   }
   console.error("[原封] 所有下载方式均失败");
-  flashBadge(job.tab, "✕");
+  flashBadge(job.tab, "✕", "#D93025");
 }
 
 function toBase64(buf) {
@@ -416,16 +579,17 @@ function toBase64(buf) {
 }
 
 // ============================================================
-// 10. data:image URL 直接下载
+// 12. data: URL 直接下载
 // ============================================================
 async function downloadDataUrl(src, tab) {
-  const m = src.match(/^data:image\/([a-z0-9.+-]+)/i);
+  const m = src.match(/^data:(?:image|video)\/([a-z0-9.+-]+)/i);
   let ext = "png";
   if (m) {
-    const mapped = EXT_BY_MIME["image/" + m[1].toLowerCase()];
-    ext = mapped || normalizeExt(m[1]) || "png";
+    const rawFmt = m[1].toLowerCase();
+    const mapped = EXT_BY_MIME["image/" + rawFmt] || EXT_BY_MIME["video/" + rawFmt];
+    ext = mapped || normalizeExt(rawFmt) || "png";
   }
-  const filename = sanitize("image_" + Date.now() + "." + ext);
+  const filename = sanitize("media_" + Date.now() + "." + ext);
   expectedDataName = filename;
   try {
     const id = await chrome.downloads.download({
@@ -435,16 +599,17 @@ async function downloadDataUrl(src, tab) {
       conflictAction: "uniquify",
     });
     pendingById.set(id, filename);
+    flashBadge(tab, "✓", "#00BA7C", 1800);
   } catch (err) {
     if (!/cancel/i.test((err && err.message) || "")) {
       console.error("[原封] data URL 下载失败:", err && err.message);
-      flashBadge(tab, "✕");
+      flashBadge(tab, "✕", "#D93025");
     }
   }
 }
 
 // ============================================================
-// 11. HEAD 预检：候选是否存在（预检自身出错时不挡路）
+// 13. HEAD 预检
 // ============================================================
 async function headOk(url) {
   if (!/^https?:/i.test(url)) return true;
@@ -459,13 +624,10 @@ async function headOk(url) {
     clearTimeout(timer);
     return resp.ok;
   } catch (_) {
-    return true; // 网络/CORS 等预检失败不代表下载会失败，放行
+    return true;
   }
 }
 
-// ============================================================
-// 11b. 扩展名未知时用 HEAD 请求探测 Content-Type
-// ============================================================
 async function headExt(url) {
   if (!/^https?:/i.test(url)) return null;
   try {
@@ -486,22 +648,30 @@ async function headExt(url) {
 }
 
 // ============================================================
-// 12. 生成文件名
+// 14. 生成文件名
 // ============================================================
-function buildFilename(imageUrl, ext) {
+function buildFilename(mediaUrl, ext) {
   let url;
   try {
-    url = new URL(imageUrl);
+    url = new URL(mediaUrl);
   } catch (_) {
-    return sanitize("image_" + Date.now() + "." + ext);
+    return sanitize("media_" + Date.now() + "." + ext);
   }
 
   let base = null;
 
-  // Twitter/X：取 media ID
+  // Twitter/X：提取 media ID 或 tweet_video ID
   if (url.hostname.endsWith("twimg.com")) {
-    const m = url.pathname.match(/\/media\/([A-Za-z0-9_\-]+)/);
+    let m = url.pathname.match(/\/media\/([A-Za-z0-9_\-]+)/);
     if (m) base = m[1];
+    if (!base) {
+      m = url.pathname.match(/\/tweet_video\/([A-Za-z0-9_\-]+)/);
+      if (m) base = m[1];
+    }
+    if (!base) {
+      m = url.pathname.match(/\/tweet_video_thumb\/([A-Za-z0-9_\-]+)/);
+      if (m) base = m[1];
+    }
   }
 
   // 通用：路径最后一段去掉扩展名
@@ -515,9 +685,8 @@ function buildFilename(imageUrl, ext) {
     }
   }
 
-  if (!base) base = "image_" + Date.now();
+  if (!base) base = "media_" + Date.now();
 
-  // URL 编码的中文等解码成可读文件名
   try { base = decodeURIComponent(base); } catch (_) {}
   if (base.length > 120) base = base.substring(0, 120);
 
@@ -525,32 +694,49 @@ function buildFilename(imageUrl, ext) {
 }
 
 // ============================================================
-// 13. 失败提示：工具栏图标闪一个红色 ✕ 徽章
+// 15. 读取设置
 // ============================================================
-function flashBadge(tab, text) {
+function getSettings() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(
+      {
+        gifFormat: "gif", // "gif" | "mp4"
+        gifMaxWidth: 640, // 480 | 640 | 0 (original)
+        gifFps: 20,       // 15 | 20 | 25
+      },
+      (res) => resolve(res)
+    );
+  });
+}
+
+// ============================================================
+// 16. 提示徽章
+// ============================================================
+function flashBadge(tab, text, color = "#D93025", duration = 2500) {
   try {
     const opts = tab && tab.id != null && tab.id >= 0 ? { tabId: tab.id } : {};
-    chrome.action.setBadgeBackgroundColor({ ...opts, color: "#D93025" }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ ...opts, color: color }).catch(() => {});
     chrome.action.setBadgeText({ ...opts, text: text }).catch(() => {});
-    setTimeout(() => {
-      chrome.action.setBadgeText({ ...opts, text: "" }).catch(() => {});
-    }, 2500);
+    if (duration > 0) {
+      setTimeout(() => {
+        chrome.action.setBadgeText({ ...opts, text: "" }).catch(() => {});
+      }, duration);
+    }
   } catch (_) {}
 }
 
 // ============================================================
-// 工具函数
+// 17. 工具函数
 // ============================================================
 function isDownloadableUrl(u) {
-  // blob: 在 Service Worker 里下载不了（属于页面上下文），明确排除
-  return typeof u === "string" && (/^https?:\/\//i.test(u) || /^data:image\//i.test(u));
+  return typeof u === "string" && (/^https?:\/\//i.test(u) || /^data:(image|video)\//i.test(u));
 }
 
-function looksLikeImage(s) {
+function looksLikeMedia(s) {
   try {
     const u = new URL(s);
-    if (/\.(jpg|jpeg|png|gif|webp|avif|svg|bmp|tiff|ico)(\?|$)/i.test(u.pathname)) return true;
-    if (u.hostname.endsWith("twimg.com") && u.pathname.startsWith("/media/")) return true;
+    if (/\.(jpg|jpeg|png|gif|webp|avif|svg|bmp|tiff|ico|mp4|webm)(\?|$)/i.test(u.pathname)) return true;
+    if (u.hostname.endsWith("twimg.com") && (u.pathname.startsWith("/media/") || u.pathname.startsWith("/tweet_video/"))) return true;
     if (u.searchParams.has("format")) return true;
   } catch (_) {}
   return false;
@@ -577,6 +763,6 @@ function sanitize(name) {
   let s = String(name).replace(/[\\/:*?"<>|]/g, "_");
   s = s.replace(/[\x00-\x1f\x7f]/g, "");
   s = s.replace(/^[. ]+/, "").replace(/[. ]+$/, "");
-  if (!s) s = "image_" + Date.now();
+  if (!s) s = "media_" + Date.now();
   return s;
 }
